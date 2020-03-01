@@ -99,14 +99,9 @@ func (j *JS) ListAssets(offset, limit int32) ([]jms.Asset, error) {
 }
 
 //AddAsset to jumpserver
-func (j *JS) AddAsset(ip, hostname, platform string, port int32) (string, error) {
+func (j *JS) AddAsset(asset jms.Asset) (string, error) {
 	defer j.refreshAccessToken()
-	asset, _, err := j.client.AssetsAssetsApi.AssetsAssetsCreate(*j.ctx, jms.Asset{
-		Ip:       ip,
-		Hostname: hostname,
-		Port:     port,
-		Platform: platform,
-	})
+	asset, _, err := j.client.AssetsAssetsApi.AssetsAssetsCreate(*j.ctx, asset)
 	if err != nil {
 		return "", err
 	}
@@ -167,9 +162,9 @@ func (e *AssetNotFoundError) Error() string {
 }
 
 //DelAsset from jumpserver
-func (j *JS) DelAsset(hostname string) error {
+func (j *JS) DelAsset(asset jms.Asset) error {
 	defer j.refreshAccessToken()
-	asset, err := j.GetAssetByHostname(hostname)
+	asset, err := j.GetAssetByHostname(asset.Hostname)
 	if _, ok := err.(*AssetNotFoundError); ok {
 		return nil
 	}

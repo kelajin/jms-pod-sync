@@ -1,4 +1,4 @@
-module jms-pod-sync
+module github.com/kelajin/jms-pod-sync
 
 go 1.13
 

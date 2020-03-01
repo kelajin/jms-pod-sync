@@ -3,18 +3,21 @@ package main
 import (
 	"flag"
 	"fmt"
-	"jms-pod-sync/jumpserver"
-	"jms-pod-sync/kubernetes"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	set "github.com/deckarep/golang-set"
+
+	"github.com/kelajin/jms-pod-sync/jumpserver"
+	"github.com/kelajin/jms-pod-sync/kubernetes"
+	jms "github.com/kelajin/jumpserver-client-go"
+	v1 "k8s.io/api/core/v1"
+
 	"github.com/gin-gonic/gin"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/op/go-logging"
-	v1 "k8s.io/api/core/v1"
 )
 
 var log = logging.MustGetLogger("jpsync")
@@ -35,7 +38,6 @@ var (
 	interval          time.Duration
 	jmsCli            *jumpserver.JS
 	kubeCli           *kubernetes.Kubernetes
-	podCaches         map[string]*PodCache
 )
 
 const (
@@ -43,22 +45,7 @@ const (
 	alreadyAdded
 	waitToDel
 )
-
-//SSHPort expose ssh port
-type SSHPort struct {
-	name          string
-	containerPort int32
-	containerName string
-}
-
-//PodCache support cache pods
-type PodCache struct {
-	name     string
-	ip       string
-	status   int32
-	assetID  string
-	sshPorts []SSHPort
-}
+const nameSep = "__"
 
 func init() {
 	backend := logging.NewLogBackend(os.Stderr, "", 0)
@@ -96,7 +83,6 @@ func init() {
 			flag.Usage()
 		}
 	}
-	podCaches = map[string]*PodCache{}
 }
 
 func usage() {
@@ -119,13 +105,12 @@ func checkFlag() error {
 	}
 	if host == "" {
 		return fmt.Errorf("host can not be empty")
-	} else {
-		if !strings.HasPrefix(host, "http://") {
-			host = "http://" + host
-		}
-		if !strings.HasSuffix(host, "/api/v1") {
-			host = host + "/api/v1"
-		}
+	}
+	if !strings.HasPrefix(host, "http://") {
+		host = "http://" + host
+	}
+	if !strings.HasSuffix(host, "/api/v1") {
+		host = host + "/api/v1"
 	}
 	if username == "" {
 		return fmt.Errorf("username can not be empty")
@@ -168,170 +153,85 @@ func syncPodToJms() {
 }
 
 func syncPodToJms0() error {
-	log.Info("Starting pod collection...")
 	pods, err := kubeCli.GetPods(namespace, label, 65535)
 	if err != nil {
 		return err
 	}
-	pods = filterPodsWhichHaveSSHPorts(pods)
-	log.Infof("Collected %d pods which have ssh ports in k8s cluster", len(pods))
-	foundSet := set.NewSet()
-	for _, pod := range pods {
-		foundSet.Add(pod.Name)
-	}
-	assets, err := jmsCli.ListAssets(0, 65535)
-	log.Infof("Collected %d assets in jumpserver", len(assets))
+	assetsFromKube, err := convertPodsToAssets(pods)
 	if err != nil {
 		return err
 	}
-	lostSet := set.NewSet()
-	stillSet := set.NewSet()
+	log.Infof("Generated %d assets from pods of k8s which have ssh ports", len(assetsFromKube))
+	assetsFromJms, err := jmsCli.ListAssets(0, 65535)
+	log.Infof("There are %d assets in jumpserver", len(assetsFromJms))
+	assetsFromKubeNameSet := getAssetsNameSet(assetsFromKube)
+	assetsFromJmsNameSet := getAssetsNameSet(assetsFromJms)
+	stillAssetsNameSet := assetsFromKubeNameSet.Intersect(assetsFromJmsNameSet)
+	foundAssetNameSet := assetsFromKubeNameSet.Difference(stillAssetsNameSet)
+	lostAssetNameSet := assetsFromJmsNameSet.Difference(stillAssetsNameSet)
+	log.Infof("There are %d found asset and %d lost asset and %d still asset", foundAssetNameSet.Cardinality(), lostAssetNameSet.Cardinality(), stillAssetsNameSet.Cardinality())
+	addFoundAssetToJms(assetsFromKube, foundAssetNameSet)
+	delLostAssetFromJms(assetsFromJms, lostAssetNameSet)
+	return nil
+}
+
+func addFoundAssetToJms(assetsFromKube []jms.Asset, foundAssetNameSet set.Set) {
+	for _, asset := range assetsFromKube {
+		if foundAssetNameSet.Contains(asset.Hostname) {
+			_, err := jmsCli.AddAsset(asset)
+			if err != nil {
+				log.Error(err.Error())
+			} else {
+				log.Infof("Add pod %s to jumpserver successed", asset.Hostname)
+			}
+		}
+	}
+}
+func delLostAssetFromJms(assetsFromJms []jms.Asset, lostAssetNameSet set.Set) {
+	for _, asset := range assetsFromJms {
+		if lostAssetNameSet.Contains(asset.Hostname) {
+			err := jmsCli.DelAsset(asset)
+			if err != nil {
+				log.Error(err.Error())
+			} else {
+				log.Infof("Del pod %s from jumpserver successed", asset.Hostname)
+			}
+		}
+	}
+}
+
+func getAssetsNameSet(assets []jms.Asset) set.Set {
+	nameSet := set.NewSet()
 	for _, asset := range assets {
-		hostname := asset.Hostname
-		podName := strings.Split(hostname, "_")[0]
-		if !foundSet.Contains(podName) {
-			lostSet.Add(podName)
-		} else {
-			stillSet.Add(podName)
-		}
+		nameSet.Add(asset.Hostname)
 	}
-	foundSet = foundSet.Difference(stillSet)
-	log.Infof("There are %d pods wait to add to jumpserver", foundSet.Cardinality())
-	log.Infof("There are %d pods wait to del from jumpserver", lostSet.Cardinality())
-	log.Infof("There are %d pods already added to jumpserver", stillSet.Cardinality())
-	refreshPodCaches(pods, podCaches, foundSet, lostSet, stillSet)
-	executePodSync(podCaches)
-	return nil
+	return nameSet
 }
 
-func filterPodsWhichHaveSSHPorts(pods []v1.Pod) []v1.Pod {
-	res := []v1.Pod{}
+func convertPodsToAssets(pods []v1.Pod) ([]jms.Asset, error) {
+	assets := []jms.Asset{}
 	for _, pod := range pods {
-		isFoundSSHPort := false
+		namePrefix := pod.Name
+		ip := pod.Status.PodIP
 		for _, container := range pod.Spec.Containers {
+			nameMiddle := container.Name
 			for _, port := range container.Ports {
-				if strings.HasPrefix(port.Name, sshPortNamePrefix) {
-					isFoundSSHPort = true
+				nameSuffix := port.Name
+				if !strings.HasPrefix(nameSuffix, sshPortNamePrefix) {
+					continue
 				}
-			}
-		}
-		if isFoundSSHPort {
-			res = append(res, pod)
-		}
-	}
-	return res
-}
-
-func refreshPodCaches(pods []v1.Pod, podCaches map[string]*PodCache, foundSet, lostSet, stillSet set.Set) {
-	for _, pod := range pods {
-		if podCaches[pod.Name] != nil {
-			continue
-		}
-		podCaches[pod.Name] = &PodCache{}
-		isFoundSSHPort := false
-		for _, container := range pod.Spec.Containers {
-			for _, port := range container.Ports {
-				if strings.HasPrefix(port.Name, sshPortNamePrefix) {
-					isFoundSSHPort = true
-					podCaches[pod.Name].ip = pod.Status.PodIP
-					podCaches[pod.Name].name = pod.Name
-					if lostSet.Contains(pod.Name) {
-						podCaches[pod.Name].status = waitToDel
-						log.Infof("Mark pod %s's status \"waitToDel\"", pod.Name)
-					} else if stillSet.Contains(pod.Name) {
-						podCaches[pod.Name].status = alreadyAdded
-						log.Infof("Mark pod %s's status \"alreadyAdded\"", pod.Name)
-					} else if foundSet.Contains(pod.Name) {
-						podCaches[pod.Name].status = waitToAdd
-						log.Infof("Mark pod %s's status \"waitToAdd\"", pod.Name)
-					} else {
-						log.Infof("Detected strange pod %s, which is not belong to any set", pod.Name)
-					}
-					podCaches[pod.Name].sshPorts = append(podCaches[pod.Name].sshPorts, SSHPort{
-						containerName: container.Name,
-						name:          port.Name,
-						containerPort: port.ContainerPort,
-					})
-					log.Infof("Append [%s::%s::%s::%d] to pod caches", pod.Name, container.Name, port.Name, port.ContainerPort)
+				sshPort := port.ContainerPort
+				assetName := namePrefix + nameSep + nameMiddle + nameSep + nameSuffix
+				asset := jms.Asset{
+					Ip:       ip,
+					Hostname: assetName,
+					Port:     sshPort,
+					Platform: "Linux",
+					Comment:  fmt.Sprintf("%s:%s:%s", assetName, ip, sshPort),
 				}
+				assets = append(assets, asset)
 			}
-		}
-		if !isFoundSSHPort {
-			delete(podCaches, pod.Name)
-			log.Warningf("Can not found ssh port in pod %s, but was collected", pod.Name)
 		}
 	}
-}
-
-func executePodSync(podCaches map[string]*PodCache) {
-	for podName, podCache := range podCaches {
-		if podCache.status == waitToAdd {
-			err := addPodToJms(podCache)
-			if err != nil {
-				log.Errorf("Add pod %s to jumpserver failed", podName)
-				log.Error(err.Error())
-				continue
-			}
-			podCache.status = alreadyAdded
-			log.Infof("Add pod %s to jumpserver successed", podName)
-			log.Infof("Mark pod %s's status \"alreadyAdded\"", podName)
-		}
-		if podCache.status == waitToDel {
-			err := delPodFromJms(podCache)
-			if err != nil {
-				log.Errorf("Delete pod %s from jumpserver failed", podName)
-				log.Error(err.Error())
-				continue
-			}
-			delete(podCaches, podName)
-			log.Infof("Delete pod %s from jumpserver successed", podName)
-			log.Infof("Delete Pod %s from pod caches", podName)
-		}
-	}
-}
-
-func addPodToJms(podCache *PodCache) error {
-	podIP := podCache.ip
-	podName := podCache.name
-	var assetID string
-	for _, sshPort := range podCache.sshPorts {
-		hostname := podName + "_" + sshPort.containerName
-		hasAsset, err := jmsCli.HasAsset(hostname)
-		if err != nil {
-			log.Errorf(err.Error())
-			continue
-		}
-		if !hasAsset {
-			assetID, err = jmsCli.AddAsset(podIP, hostname, "Linux", sshPort.containerPort)
-			if err != nil {
-				return err
-			}
-			podCache.assetID = assetID
-		} else {
-			podCache.status = alreadyAdded
-			log.Warningf("Asset %s already exists in jumpserver, mark pod %s to alreadyAdded", hostname, podName)
-		}
-	}
-	return nil
-}
-
-func delPodFromJms(podCache *PodCache) error {
-	podName := podCache.name
-	for _, sshPort := range podCache.sshPorts {
-		hostname := podName + "_" + sshPort.containerName
-		hasAsset, err := jmsCli.HasAsset(hostname)
-		if err != nil {
-			log.Error(err.Error())
-			return err
-		}
-		if hasAsset {
-			err := jmsCli.DelAsset(hostname)
-			if err != nil {
-				return err
-			}
-		} else {
-			log.Warningf("Asset %s does not exist in jumpserver", hostname)
-		}
-	}
-	return nil
+	return assets, nil
 }
