@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/antihax/optional"
-	jms "github.com/kelajin/jumpserver-go-sdk"
+	jms "github.com/kelajin/jumpserver-client-go"
 )
 
 // JS is jumpserver
@@ -85,8 +85,22 @@ func (j *JS) ListUsers(offset, limit int32) ([]jms.User, error) {
 	return res.Results, nil
 }
 
+//ListAssets list Assets
+func (j *JS) ListAssets(offset, limit int32) ([]jms.Asset, error) {
+	defer j.refreshAccessToken()
+	res, _, err := j.client.AssetsAssetsApi.AssetsAssetsList(*j.ctx, &jms.AssetsAssetsListOpts{
+		Offset: optional.NewInt32(offset),
+		Limit:  optional.NewInt32(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Results, nil
+}
+
 //AddAsset to jumpserver
 func (j *JS) AddAsset(ip, hostname, platform string, port int32) (string, error) {
+	defer j.refreshAccessToken()
 	asset, _, err := j.client.AssetsAssetsApi.AssetsAssetsCreate(*j.ctx, jms.Asset{
 		Ip:       ip,
 		Hostname: hostname,
@@ -99,31 +113,22 @@ func (j *JS) AddAsset(ip, hostname, platform string, port int32) (string, error)
 	return asset.Id, nil
 }
 
-//HaveAsset return if asset already exists
-func (j *JS) HaveAsset(hostname string) bool {
+//HasAsset return if asset already exists
+func (j *JS) HasAsset(hostname string) (bool, error) {
+	defer j.refreshAccessToken()
 	_, err := j.GetAssetByHostname(hostname)
-	return err == nil
-}
-
-//HaveAssetUser return if asset already exists in user
-func (j *JS) HaveAssetUser(username, assetID string) bool {
-	res, _, err := j.client.AssetsAssetUsersInfoApi.AssetsAssetUsersInfoList(*j.ctx, &jms.AssetsAssetUsersInfoListOpts{
-		Limit:  optional.NewInt32(65535),
-		Offset: optional.NewInt32(0),
-	})
+	if _, ok := err.(*AssetNotFoundError); ok {
+		return false, nil
+	}
 	if err != nil {
-		return false
+		return false, err
 	}
-	for _, aue := range res.Results {
-		if aue.Asset == assetID {
-			return true
-		}
-	}
-	return false
+	return true, nil
 }
 
 //AddAssetToUser to jumpserver
 func (j *JS) AddAssetToUser(username string, assetID string) error {
+	defer j.refreshAccessToken()
 	_, _, err := j.client.AssetsAssetUsersApi.AssetsAssetUsersCreate(*j.ctx, jms.AssetUser{
 		Username: username,
 		Asset:    assetID,
@@ -136,8 +141,11 @@ func (j *JS) AddAssetToUser(username string, assetID string) error {
 
 //GetAssetByHostname from jumpserver
 func (j *JS) GetAssetByHostname(hostname string) (jms.Asset, error) {
+	defer j.refreshAccessToken()
 	asset, _, err := j.client.AssetsAssetsApi.AssetsAssetsList(*j.ctx, &jms.AssetsAssetsListOpts{
 		Hostname: optional.NewString(hostname),
+		Limit:    optional.NewInt32(65535),
+		Offset:   optional.NewInt32(0),
 	})
 	if err != nil {
 		return jms.Asset{}, err
@@ -146,12 +154,25 @@ func (j *JS) GetAssetByHostname(hostname string) (jms.Asset, error) {
 	if len(res) > 0 {
 		return res[0], nil
 	}
-	return jms.Asset{}, fmt.Errorf("can not found asset which hostname is " + hostname)
+	return jms.Asset{}, &AssetNotFoundError{hostname}
+}
+
+//AssetNotFoundError is error for asset not found in jumpserver
+type AssetNotFoundError struct {
+	hostname string
+}
+
+func (e *AssetNotFoundError) Error() string {
+	return fmt.Sprintf("can not found asset which hostnamem is %s", e.hostname)
 }
 
 //DelAsset from jumpserver
 func (j *JS) DelAsset(hostname string) error {
+	defer j.refreshAccessToken()
 	asset, err := j.GetAssetByHostname(hostname)
+	if _, ok := err.(*AssetNotFoundError); ok {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
