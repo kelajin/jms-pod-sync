@@ -227,7 +227,7 @@ func convertPodsToAssets(pods []v1.Pod) ([]jms.Asset, error) {
 					Hostname: assetName,
 					Port:     sshPort,
 					Platform: "Linux",
-					Comment:  fmt.Sprintf("%s:%s:%s", assetName, ip, sshPort),
+					Comment:  fmt.Sprintf("%s:%s:%d", assetName, ip, sshPort),
 				}
 				assets = append(assets, asset)
 			}
