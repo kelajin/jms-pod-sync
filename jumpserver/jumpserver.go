@@ -98,6 +98,29 @@ func (j *JS) ListAssets(offset, limit int32) ([]jms.Asset, error) {
 	return res.Results, nil
 }
 
+//GetAdminUserID from jumpserver
+func (j *JS) GetAdminUserID(adminUserName string) (string, error) {
+	defer j.refreshAccessToken()
+	res, _, err := j.client.AssetsAdminUsersApi.AssetsAdminUsersList(*j.ctx, &jms.AssetsAdminUsersListOpts{
+		Name:   optional.NewString(adminUserName),
+		Limit:  optional.NewInt32(65535),
+		Offset: optional.NewInt32(0),
+	})
+	if err != nil {
+		return "", err
+	}
+	id := ""
+	for _, user := range res.Results {
+		if user.Name == adminUserName {
+			id = user.Id
+		}
+	}
+	if id == "" {
+		return id, fmt.Errorf("can not found admin-user which name is %s", adminUserName)
+	}
+	return id, nil
+}
+
 //AddAsset to jumpserver
 func (j *JS) AddAsset(asset jms.Asset) (string, error) {
 	defer j.refreshAccessToken()

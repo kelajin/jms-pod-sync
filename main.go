@@ -32,6 +32,7 @@ var (
 	host              string
 	kubeConfigPath    string
 	port              string
+	adminUser         string
 	namespace         string
 	label             string
 	sshPortNamePrefix string
@@ -62,6 +63,7 @@ func init() {
 	flag.StringVar(&label, "label", "ssh.port/open=true", "watch label")
 	flag.StringVar(&sshPortNamePrefix, "ssh-port-name-prefix", "ssh", "ssh port name prefix")
 	flag.StringVar(&port, "port", ":8080", "listening port")
+	flag.StringVar(&adminUser, "admin-user", "root", "admin user")
 	flag.DurationVar(&interval, "interval", time.Minute, "sync interval")
 	flag.StringVar(&kubeConfigPath, "kubeconfig", "$HOME/.kube/config", "kube config")
 	flag.Usage = usage
@@ -210,6 +212,11 @@ func getAssetsNameSet(assets []jms.Asset) set.Set {
 
 func convertPodsToAssets(pods []v1.Pod) ([]jms.Asset, error) {
 	assets := []jms.Asset{}
+	adminUserID, err := jmsCli.GetAdminUserID(adminUser)
+	if err != nil {
+		log.Errorf("Can not get ID of admin-user %s", adminUser)
+		adminUserID = ""
+	}
 	for _, pod := range pods {
 		namePrefix := pod.Name
 		ip := pod.Status.PodIP
@@ -222,12 +229,14 @@ func convertPodsToAssets(pods []v1.Pod) ([]jms.Asset, error) {
 				}
 				sshPort := port.ContainerPort
 				assetName := namePrefix + nameSep + nameMiddle + nameSep + nameSuffix
-				asset := jms.Asset{
-					Ip:       ip,
-					Hostname: assetName,
-					Port:     sshPort,
-					Platform: "Linux",
-					Comment:  fmt.Sprintf("%s:%s:%d", assetName, ip, sshPort),
+				asset := jms.Asset{}
+				asset.Ip = ip
+				asset.Hostname = assetName
+				asset.Port = sshPort
+				asset.Platform = "Linux"
+				asset.Comment = fmt.Sprintf("%s:%s:%d", assetName, ip, sshPort)
+				if adminUserID != "" {
+					asset.AdminUser = adminUserID
 				}
 				assets = append(assets, asset)
 			}
